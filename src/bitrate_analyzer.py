@@ -5,6 +5,7 @@ import time
 import os
 import numpy as np
 from pymediainfo import MediaInfo
+import csv
 
 # Function to download a segment of an RTSP stream
 def download_rtsp_segment(rtsp_url, output_file, duration=5):
@@ -41,18 +42,21 @@ def download_rtsp_segment(rtsp_url, output_file, duration=5):
 def get_bitrate(file_path):
     print(f"Getting bitrate for file {file_path}")
     media_info = MediaInfo.parse(file_path)
+    # Get the bitrate of the video track, if available
     for track in media_info.tracks:
         if track.track_type == "Video":
             if track.bit_rate:
                 return track.bit_rate
+            # If the bitrate is not available, try to get it from the other_bit_rate field
             elif track.other_bit_rate:
                 return float(track.other_bit_rate[0].replace(" ", "").replace("bps", ""))
     return None
 
 
-def average_bitrate(rtsp_url, observations=1, segment_duration=2): # Default segment duration is 2 seconds and number of observations is 1, change as needed!
+def average_bitrate(rtsp_url, observations=2, segment_duration=3):
     print(f"Calculating average bitrate for {rtsp_url}")
     bitrates = []
+    discard_threshold = int(0.2 * observations)  # Discard first 20% of observations, as they may contain initial buffering
     for i in range(observations):
         output_file = f'temp_segment_{i}.avi'
         print(f"Observation {i+1}/{observations}")
@@ -60,7 +64,8 @@ def average_bitrate(rtsp_url, observations=1, segment_duration=2): # Default seg
             bitrate = get_bitrate(output_file)
             if bitrate:
                 print(f"Bitrate for segment {i+1}: {bitrate} bps")
-                bitrates.append(bitrate)
+                if i >= discard_threshold:
+                    bitrates.append(bitrate)
             else:
                 print(f"Failed to get bitrate for segment {i+1}")
             print(f"Removing temporary file {output_file}")
@@ -75,18 +80,29 @@ def average_bitrate(rtsp_url, observations=1, segment_duration=2): # Default seg
     print(f"No valid bitrates collected for {rtsp_url}")
     return None
 
+def write_to_csv(data, filename):
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["IP Address", "Average Bitrate (kbps)"])
+        for item in data:
+            writer.writerow(item)
+
 def main(stream_urls):
+    results = []
     for url in stream_urls:
         print(f"Processing URL {url}")
         avg_bitrate = average_bitrate(url)
         if avg_bitrate:
             print(f'The average bitrate for {url} is {avg_bitrate / 1000:.2f} kbps')
+            results.append([url, avg_bitrate / 1000])
         else:
             print(f'No bitrate data collected for {url}')
+    write_to_csv(results, 'output/bitrate_data.csv')
 
 # Insert your RTSP stream URLs here
 if __name__ == '__main__':
     stream_urls = [
         # Example: 'rtsp://ipaddress/stream',
+        
     ]
     main(stream_urls)

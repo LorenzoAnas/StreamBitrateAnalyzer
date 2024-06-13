@@ -51,3 +51,5 @@ if __name__ == '__main__':
     main(stream_urls)
 ```
 
+The results are then stored in a csv file inside the /output folder of the project
+
