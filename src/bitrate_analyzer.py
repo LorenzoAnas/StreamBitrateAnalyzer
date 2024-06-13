@@ -6,6 +6,7 @@ import os
 import numpy as np
 from pymediainfo import MediaInfo
 import csv
+import argparse
 
 # Function to download a segment of an RTSP stream
 def download_rtsp_segment(rtsp_url, output_file, duration=5):
@@ -101,8 +102,13 @@ def main(stream_urls):
 
 # Insert your RTSP stream URLs here
 if __name__ == '__main__':
-    stream_urls = [
+    parser = argparse.ArgumentParser(description='Process RTSP stream URLs.')
+    parser.add_argument('stream_urls', metavar='N', type=str, nargs='*',
+                        help='an RTSP stream URL for processing')
+    args = parser.parse_args()
+
+    # If no URLs are passed from the command line, use the URLs from the list
+    stream_urls = args.stream_urls if args.stream_urls else [
         # Example: 'rtsp://ipaddress/stream',
-        
     ]
     main(stream_urls)
