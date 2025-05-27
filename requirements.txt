@@ -1,3 +1,5 @@
 numpy
 pymediainfo
 opencv-python
+matplotlib
+tqdm

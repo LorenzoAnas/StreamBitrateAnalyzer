@@ -160,3 +160,11 @@ cython_debug/
 #.idea/
 
 /src/output/bitrate_data.csv
+
+# Project specific
+/src/output/
+/output/
+/logs/
+config.json
+stream_urls.csv
+*.log
