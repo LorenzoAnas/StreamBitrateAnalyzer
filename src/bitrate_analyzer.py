@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 import subprocess
+import socket
+import urllib.parse
 
 def setup_logging(log_level="INFO"):
     """Set up logging configuration."""
@@ -39,7 +41,9 @@ def load_config(config_file='config.json'):
         "stream_urls_file": "stream_urls.csv",
         "log_level": "INFO",
         "retry_attempts": 3,
-        "timeout_seconds": 30
+        "timeout_seconds": 30,
+        "connection_timeout": 10,
+        "use_udp_fallback": True
     }
     
     try:
@@ -105,20 +109,56 @@ def check_ffmpeg_availability():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def get_stream_bitrate_direct(rtsp_url, duration=10, timeout=30):
-    """Get bitrate directly from RTSP stream using FFmpeg without saving files."""
+def test_stream_connectivity(rtsp_url, timeout=5):
+    """Test basic connectivity to RTSP stream before analysis."""
     logger = logging.getLogger(__name__)
     
     try:
-        # Use FFmpeg to analyze stream for specified duration and get bitrate info
+        # Parse RTSP URL to get host and port
+        parsed = urllib.parse.urlparse(rtsp_url)
+        host = parsed.hostname
+        port = parsed.port or 554  # Default RTSP port
+        
+        if not host:
+            logger.warning(f"✗ Invalid URL format: {rtsp_url}")
+            return False
+        
+        # Test TCP connection
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        
+        if result == 0:
+            logger.info(f"✓ TCP connection to {host}:{port} successful")
+            return True
+        else:
+            logger.warning(f"✗ Cannot connect to {host}:{port} (error: {result})")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"✗ Connectivity test failed for {rtsp_url}: {e}")
+        return False
+
+def get_stream_bitrate_direct_tcp(rtsp_url, duration=10, timeout=30, connection_timeout=10):
+    """Get bitrate using TCP transport."""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Enhanced FFmpeg command with better RTSP handling
         cmd = [
             'ffmpeg', 
             '-rtsp_transport', 'tcp',
+            '-rtsp_flags', 'prefer_tcp',
+            '-stimeout', str(connection_timeout * 1000000),  # Connection timeout in microseconds
             '-i', rtsp_url,
             '-t', str(duration),
             '-f', 'null',
+            '-y',  # Overwrite output
             '-'
         ]
+        
+        logger.debug(f"Running FFmpeg TCP command: {' '.join(cmd)}")
         
         result = subprocess.run(
             cmd,
@@ -130,36 +170,103 @@ def get_stream_bitrate_direct(rtsp_url, duration=10, timeout=30):
         
         # Parse FFmpeg output for bitrate information
         stderr_output = result.stderr
+        logger.debug(f"FFmpeg stderr: {stderr_output}")
         
         # Look for bitrate information in FFmpeg output
         bitrate = None
         for line in stderr_output.split('\n'):
             if 'bitrate=' in line and 'kbits/s' in line:
-                # Extract bitrate from line like "bitrate= 1234.5kbits/s"
                 try:
                     bitrate_str = line.split('bitrate=')[1].split('kbits/s')[0].strip()
                     bitrate_kbps = float(bitrate_str)
                     bitrate = int(bitrate_kbps * 1000)  # Convert to bps
-                    logger.info(f"FFmpeg reports stream bitrate: {bitrate_kbps:.2f} kbps")
+                    logger.info(f"FFmpeg TCP reports stream bitrate: {bitrate_kbps:.2f} kbps")
                     break
                 except (ValueError, IndexError):
                     continue
         
-        # Fallback: use file size method if direct bitrate not found
-        if bitrate is None:
-            bitrate = get_stream_bitrate_filesize(rtsp_url, duration, timeout)
+        return bitrate
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"FFmpeg TCP timeout after {timeout} seconds")
+        return None
+    except Exception as e:
+        logger.error(f"Exception during FFmpeg TCP analysis: {e}")
+        return None
+
+def get_stream_bitrate_direct_udp(rtsp_url, duration=10, timeout=30):
+    """Get bitrate using UDP transport as fallback."""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        cmd = [
+            'ffmpeg', 
+            '-rtsp_transport', 'udp',
+            '-i', rtsp_url,
+            '-t', str(duration),
+            '-f', 'null',
+            '-y',
+            '-'
+        ]
+        
+        logger.debug(f"Running FFmpeg UDP command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True
+        )
+        
+        stderr_output = result.stderr
+        logger.debug(f"FFmpeg UDP stderr: {stderr_output}")
+        
+        # Look for bitrate information
+        bitrate = None
+        for line in stderr_output.split('\n'):
+            if 'bitrate=' in line and 'kbits/s' in line:
+                try:
+                    bitrate_str = line.split('bitrate=')[1].split('kbits/s')[0].strip()
+                    bitrate_kbps = float(bitrate_str)
+                    bitrate = int(bitrate_kbps * 1000)
+                    logger.info(f"FFmpeg UDP reports stream bitrate: {bitrate_kbps:.2f} kbps")
+                    break
+                except (ValueError, IndexError):
+                    continue
         
         return bitrate
         
     except subprocess.TimeoutExpired:
-        logger.warning(f"FFmpeg timeout after {timeout} seconds")
+        logger.warning(f"FFmpeg UDP timeout after {timeout} seconds")
         return None
     except Exception as e:
-        logger.error(f"Exception during FFmpeg analysis: {e}")
+        logger.error(f"Exception during FFmpeg UDP analysis: {e}")
         return None
 
-def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30):
-    """Fallback method: measure bitrate by file size."""
+def get_stream_bitrate_direct(rtsp_url, duration=10, timeout=30, connection_timeout=10, use_udp_fallback=True):
+    """Get bitrate with TCP first, UDP fallback option."""
+    logger = logging.getLogger(__name__)
+    
+    # Try TCP first
+    bitrate = get_stream_bitrate_direct_tcp(rtsp_url, duration, timeout, connection_timeout)
+    
+    if bitrate and bitrate > 0:
+        return bitrate
+    
+    # Try UDP fallback if enabled and TCP failed
+    if use_udp_fallback:
+        logger.info("TCP failed, trying UDP transport...")
+        bitrate = get_stream_bitrate_direct_udp(rtsp_url, duration, timeout)
+        if bitrate and bitrate > 0:
+            return bitrate
+    
+    # Fallback to file size method
+    logger.info("Direct bitrate measurement failed, trying file size method...")
+    return get_stream_bitrate_filesize(rtsp_url, duration, timeout, connection_timeout)
+
+def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30, connection_timeout=10):
+    """Fallback method: measure bitrate by file size with improved connection handling."""
     logger = logging.getLogger(__name__)
     
     with tempfile.NamedTemporaryFile(suffix='.ts', delete=False) as temp_file:
@@ -169,12 +276,17 @@ def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30):
         cmd = [
             'ffmpeg', '-y',
             '-rtsp_transport', 'tcp',
+            '-rtsp_flags', 'prefer_tcp',
+            '-stimeout', str(connection_timeout * 1000000),
             '-i', rtsp_url,
             '-t', str(duration),
             '-c', 'copy',
             '-avoid_negative_ts', 'make_zero',
+            '-f', 'mpegts',
             output_file
         ]
+        
+        logger.debug(f"Running FFmpeg filesize command: {' '.join(cmd)}")
         
         result = subprocess.run(
             cmd,
@@ -183,6 +295,8 @@ def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30):
             timeout=timeout,
             text=True
         )
+        
+        logger.debug(f"FFmpeg filesize stderr: {result.stderr}")
         
         if result.returncode == 0 and os.path.exists(output_file):
             file_size = os.path.getsize(output_file)
@@ -194,7 +308,7 @@ def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30):
         return None
         
     except subprocess.TimeoutExpired:
-        logger.warning(f"FFmpeg timeout during file size measurement")
+        logger.warning(f"FFmpeg filesize timeout after {timeout} seconds")
         return None
     except Exception as e:
         logger.error(f"Exception during file size measurement: {e}")
@@ -244,6 +358,12 @@ def analyze_stream_bitrate(rtsp_url, config):
     logger = logging.getLogger(__name__)
     logger.info(f"Analyzing bitrate for {rtsp_url}")
     
+    # Test connectivity first
+    connection_timeout = config.get('connection_timeout', 10)
+    if not test_stream_connectivity(rtsp_url, connection_timeout):
+        logger.error(f"Stream {rtsp_url} is not accessible - skipping")
+        return None, [], None, None, None
+    
     bitrates = []
     segment_bitrates = []
     
@@ -252,6 +372,7 @@ def analyze_stream_bitrate(rtsp_url, config):
     discard_threshold = config['discard_threshold']
     retry_attempts = config.get('retry_attempts', 3)
     timeout = config.get('timeout_seconds', 30)
+    use_udp_fallback = config.get('use_udp_fallback', True)
     
     discard_samples = int(discard_threshold * samples)
     
@@ -263,8 +384,14 @@ def analyze_stream_bitrate(rtsp_url, config):
         
         success = False
         for attempt in range(retry_attempts):
-            # Try direct bitrate measurement first
-            bitrate = get_stream_bitrate_direct(rtsp_url, segment_duration, timeout)
+            # Try bitrate measurement with fallback options
+            bitrate = get_stream_bitrate_direct(
+                rtsp_url, 
+                segment_duration, 
+                timeout, 
+                connection_timeout,
+                use_udp_fallback
+            )
             
             if bitrate and bitrate > 0:
                 logger.info(f"Measured bitrate for sample {i+1}: {bitrate/1000:.2f} kbps")
