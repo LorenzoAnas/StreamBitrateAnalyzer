@@ -1,8 +1,6 @@
-import cv2
 import time
 import os
 import numpy as np
-from pymediainfo import MediaInfo
 import csv
 import argparse
 import matplotlib.pyplot as plt
@@ -12,6 +10,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
+import subprocess
 
 def setup_logging(log_level="INFO"):
     """Set up logging configuration."""
@@ -35,7 +34,6 @@ def load_config(config_file='config.json'):
         "segment_duration": 10,
         "discard_threshold": 0.2,
         "output_directory": "output",
-        "temp_file_prefix": "temp_segment_",
         "csv_filename": "bitrate_data.csv",
         "plot_filename": "bitrate_plot.png",
         "stream_urls_file": "stream_urls.csv",
@@ -62,14 +60,29 @@ def load_config(config_file='config.json'):
         return default_config
 
 def read_stream_urls_from_csv(filename):
-    """Read stream URLs from a CSV file."""
+    """Read stream URLs from a CSV file and construct RTSP URLs with optional authentication."""
     stream_urls = []
     try:
         with open(filename, mode='r', newline='') as file:
             reader = csv.DictReader(file)
             for row in reader:
-                if row.get('URL', '').strip():
-                    stream_urls.append(row['URL'].strip())
+                ip = row.get('ip', '').strip()
+                extended_path = row.get('extended-path', '').strip()
+                user = row.get('user', '').strip()
+                password = row.get('password', '').strip()
+                tvcc_name = row.get('tvcc-name', '').strip()
+                
+                if ip and extended_path:
+                    # Construct RTSP URL based on authentication availability
+                    if user and password:
+                        rtsp_url = f"rtsp://{user}:{password}@{ip}/{extended_path}"
+                    else:
+                        rtsp_url = f"rtsp://{ip}/{extended_path}"
+                    
+                    stream_urls.append(rtsp_url)
+                    logging.getLogger(__name__).info(f"Added stream: {tvcc_name} -> {rtsp_url}")
+                else:
+                    logging.getLogger(__name__).warning(f"Skipping invalid entry: missing IP or extended-path for {tvcc_name}")
     except FileNotFoundError:
         logging.getLogger(__name__).warning(f"Stream URLs file {filename} not found.")
     except Exception as e:
@@ -80,93 +93,156 @@ def ensure_output_directory(output_dir):
     """Ensure output directory exists."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-def download_rtsp_segment(rtsp_url, output_file, duration=5, timeout=30):
-    """Enhanced download function with better error handling."""
-    logger = logging.getLogger(__name__)
-    logger.info(f"Attempting to download RTSP segment from {rtsp_url}")
-    
+def check_ffmpeg_availability():
+    """Check if FFmpeg is available on the system."""
     try:
-        cap = cv2.VideoCapture(rtsp_url)
-        
-        # Set timeout properties
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        if not cap.isOpened():
-            logger.error(f"Could not open RTSP stream {rtsp_url}")
-            return False
-        
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        if fps <= 0:
-            fps = 25
-            logger.warning(f"Invalid FPS detected, using default: {fps}")
-        
-        if width <= 0 or height <= 0:
-            logger.error(f"Invalid video dimensions: {width}x{height}")
-            cap.release()
-            return False
-            
-        frame_count = int(duration * fps)
-        logger.info(f"Capturing {frame_count} frames at {fps} FPS")
-        
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
-        
-        frames_captured = 0
-        start_time = time.time()
-        
-        for i in tqdm(range(frame_count), desc="Capturing frames", leave=False):
-            if time.time() - start_time > timeout:
-                logger.warning(f"Timeout reached while capturing from {rtsp_url}")
-                break
-                
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning(f"Failed to read frame {i+1}")
-                break
-            out.write(frame)
-            frames_captured += 1
-        
-        cap.release()
-        out.release()
-        
-        if frames_captured > 0:
-            logger.info(f"Successfully captured {frames_captured} frames from {rtsp_url}")
-            return True
-        else:
-            logger.error(f"No frames captured from {rtsp_url}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Exception during download from {rtsp_url}: {e}")
+        result = subprocess.run(['ffmpeg', '-version'], 
+                              stdout=subprocess.PIPE, 
+                              stderr=subprocess.PIPE, 
+                              check=True, 
+                              text=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def get_bitrate(file_path):
-    """Extract bitrate from video file using pymediainfo."""
+def get_stream_bitrate_direct(rtsp_url, duration=10, timeout=30):
+    """Get bitrate directly from RTSP stream using FFmpeg without saving files."""
     logger = logging.getLogger(__name__)
-    logger.info(f"Getting bitrate for file {file_path}")
     
     try:
-        media_info = MediaInfo.parse(file_path)
-        for track in media_info.tracks:
-            if track.track_type == "Video":
-                if track.bit_rate:
-                    return track.bit_rate
-                elif track.other_bit_rate:
-                    return float(track.other_bit_rate[0].replace(" ", "").replace("bps", ""))
+        # Use FFmpeg to analyze stream for specified duration and get bitrate info
+        cmd = [
+            'ffmpeg', 
+            '-rtsp_transport', 'tcp',
+            '-i', rtsp_url,
+            '-t', str(duration),
+            '-f', 'null',
+            '-'
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True
+        )
+        
+        # Parse FFmpeg output for bitrate information
+        stderr_output = result.stderr
+        
+        # Look for bitrate information in FFmpeg output
+        bitrate = None
+        for line in stderr_output.split('\n'):
+            if 'bitrate=' in line and 'kbits/s' in line:
+                # Extract bitrate from line like "bitrate= 1234.5kbits/s"
+                try:
+                    bitrate_str = line.split('bitrate=')[1].split('kbits/s')[0].strip()
+                    bitrate_kbps = float(bitrate_str)
+                    bitrate = int(bitrate_kbps * 1000)  # Convert to bps
+                    logger.info(f"FFmpeg reports stream bitrate: {bitrate_kbps:.2f} kbps")
+                    break
+                except (ValueError, IndexError):
+                    continue
+        
+        # Fallback: use file size method if direct bitrate not found
+        if bitrate is None:
+            bitrate = get_stream_bitrate_filesize(rtsp_url, duration, timeout)
+        
+        return bitrate
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"FFmpeg timeout after {timeout} seconds")
+        return None
     except Exception as e:
-        logger.error(f"Error getting bitrate from {file_path}: {e}")
-    
-    return None
+        logger.error(f"Exception during FFmpeg analysis: {e}")
+        return None
 
-def average_bitrate(rtsp_url, config):
-    """Enhanced bitrate calculation with better file handling."""
+def get_stream_bitrate_filesize(rtsp_url, duration=10, timeout=30):
+    """Fallback method: measure bitrate by file size."""
     logger = logging.getLogger(__name__)
-    logger.info(f"Calculating average bitrate for {rtsp_url}")
+    
+    with tempfile.NamedTemporaryFile(suffix='.ts', delete=False) as temp_file:
+        output_file = temp_file.name
+    
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-rtsp_transport', 'tcp',
+            '-i', rtsp_url,
+            '-t', str(duration),
+            '-c', 'copy',
+            '-avoid_negative_ts', 'make_zero',
+            output_file
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True
+        )
+        
+        if result.returncode == 0 and os.path.exists(output_file):
+            file_size = os.path.getsize(output_file)
+            if file_size > 0:
+                bitrate = (file_size * 8) / duration  # bits per second
+                logger.info(f"Calculated bitrate from file size: {bitrate/1000:.2f} kbps")
+                return int(bitrate)
+        
+        return None
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"FFmpeg timeout during file size measurement")
+        return None
+    except Exception as e:
+        logger.error(f"Exception during file size measurement: {e}")
+        return None
+    finally:
+        # Clean up temporary file
+        try:
+            if os.path.exists(output_file):
+                os.unlink(output_file)
+        except:
+            pass
+
+def get_declared_bitrate(rtsp_url, timeout=10):
+    """Get declared bitrate from stream metadata using ffprobe."""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=bit_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            rtsp_url
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            bitrate = int(result.stdout.strip())
+            logger.info(f"Stream declares bitrate: {bitrate/1000:.2f} kbps")
+            return bitrate
+        
+        return None
+            
+    except (subprocess.TimeoutExpired, ValueError, subprocess.CalledProcessError) as e:
+        logger.debug(f"ffprobe failed: {e}")
+        return None
+
+def analyze_stream_bitrate(rtsp_url, config):
+    """Analyze stream bitrate using FFmpeg-based methods."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Analyzing bitrate for {rtsp_url}")
     
     bitrates = []
     segment_bitrates = []
@@ -179,41 +255,47 @@ def average_bitrate(rtsp_url, config):
     
     discard_samples = int(discard_threshold * samples)
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for i in range(samples):
-            output_file = Path(temp_dir) / f"{config['temp_file_prefix']}{i}.avi"
-            logger.info(f"Observation {i+1}/{samples}")
+    # Get declared bitrate from stream metadata
+    declared_bitrate = get_declared_bitrate(rtsp_url)
+    
+    for i in range(samples):
+        logger.info(f"Sample {i+1}/{samples}")
+        
+        success = False
+        for attempt in range(retry_attempts):
+            # Try direct bitrate measurement first
+            bitrate = get_stream_bitrate_direct(rtsp_url, segment_duration, timeout)
             
-            success = False
-            for attempt in range(retry_attempts):
-                if download_rtsp_segment(rtsp_url, str(output_file), segment_duration, timeout):
-                    bitrate = get_bitrate(str(output_file))
-                    if bitrate:
-                        logger.info(f"Bitrate for segment {i+1}: {bitrate} bps")
-                        if i >= discard_samples:
-                            bitrates.append(bitrate)
-                        segment_bitrates.append(bitrate)
-                        success = True
-                        break
-                    else:
-                        logger.warning(f"Failed to get bitrate for segment {i+1}, attempt {attempt+1}")
-                else:
-                    logger.warning(f"Failed to download segment {i+1}, attempt {attempt+1}")
+            if bitrate and bitrate > 0:
+                logger.info(f"Measured bitrate for sample {i+1}: {bitrate/1000:.2f} kbps")
                 
+                if i >= discard_samples:
+                    bitrates.append(bitrate)
+                segment_bitrates.append(bitrate)
+                success = True
+                break
+            else:
+                logger.warning(f"Failed to measure bitrate for sample {i+1}, attempt {attempt+1}")
                 if attempt < retry_attempts - 1:
                     time.sleep(2)
-            
-            if not success:
-                logger.error(f"Failed to get valid data for segment {i+1} after {retry_attempts} attempts")
-            
-            time.sleep(1)
+        
+        if not success:
+            logger.error(f"Failed to get valid bitrate for sample {i+1} after {retry_attempts} attempts")
+        
+        # Brief pause between samples
+        time.sleep(1)
     
     if bitrates:
         average = np.mean(bitrates)
         std_dev = np.std(bitrates)
         min_bitrate = np.min(bitrates)
         max_bitrate = np.max(bitrates)
-        logger.info(f"Average bitrate: {average:.2f} bps (±{std_dev:.2f})")
+        logger.info(f"Average measured bitrate: {average/1000:.2f} kbps (±{std_dev/1000:.2f})")
+        
+        # Compare with declared bitrate if available
+        if declared_bitrate and abs(average - declared_bitrate) / declared_bitrate > 0.1:
+            logger.warning(f"Measured bitrate ({average/1000:.2f} kbps) differs from declared ({declared_bitrate/1000:.2f} kbps)")
+        
         return average, segment_bitrates, std_dev, min_bitrate, max_bitrate
     
     logger.warning(f"No valid bitrates collected for {rtsp_url}")
@@ -260,7 +342,7 @@ def plot_bitrate_over_time(segment_bitrates, stream_urls, segment_duration, outp
 def create_argument_parser():
     """Create and configure argument parser."""
     parser = argparse.ArgumentParser(
-        description='Analyze bitrate of RTSP video streams',
+        description='Analyze bitrate of RTSP video streams using FFmpeg',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -268,6 +350,9 @@ Examples:
   python bitrate_analyzer.py --config custom_config.json --urls-file streams.csv
   python bitrate_analyzer.py --samples 10 --duration 15
   python bitrate_analyzer.py  # Uses default stream_urls.csv if available
+
+Requirements:
+  FFmpeg must be installed and available in system PATH
         """
     )
     
@@ -309,6 +394,17 @@ def main():
     # Setup logging
     logger = setup_logging(config['log_level'])
     
+    # Check FFmpeg availability - now required
+    if not check_ffmpeg_availability():
+        logger.error("FFmpeg is required but not found in system PATH")
+        logger.error("Please install FFmpeg:")
+        logger.error("  Windows: Download from https://ffmpeg.org or use 'winget install FFmpeg'")
+        logger.error("  macOS: brew install ffmpeg")
+        logger.error("  Linux: sudo apt install ffmpeg")
+        return 1
+    
+    logger.info("FFmpeg detected - ready for accurate bitrate analysis")
+    
     # Ensure output directory exists
     ensure_output_directory(config['output_directory'])
     
@@ -327,7 +423,7 @@ def main():
     
     if not stream_urls:
         logger.error("No stream URLs provided. Use command line arguments, create stream_urls.csv, or use --urls-file to specify a CSV file")
-        return
+        return 1
     
     logger.info(f"Processing {len(stream_urls)} RTSP stream URLs")
     
@@ -336,7 +432,7 @@ def main():
     
     for url in tqdm(stream_urls, desc="Processing streams"):
         logger.info(f"Processing URL: {url}")
-        avg_bitrate, segment_bitrates, std_dev, min_br, max_br = average_bitrate(url, config)
+        avg_bitrate, segment_bitrates, std_dev, min_br, max_br = analyze_stream_bitrate(url, config)
         
         if avg_bitrate:
             avg_kbps = avg_bitrate / 1000
@@ -363,6 +459,8 @@ def main():
     # Create plot
     plot_path = Path(config['output_directory']) / config['plot_filename']
     plot_bitrate_over_time(all_segment_bitrates, stream_urls, config['segment_duration'], plot_path)
+    
+    return 0
 
 if __name__ == '__main__':
-    main()
+    exit(main())

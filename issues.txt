@@ -1,1 +1,4 @@
-- Wrong output values
+- Wrong output values - FIXED: Implemented FFmpeg raw packet capture for accurate bitrate measurement
+  * Replaced OpenCV re-encoding approach with FFmpeg copy mode
+  * Added stream metadata querying for declared bitrates
+  * Maintained OpenCV fallback for systems without FFmpeg

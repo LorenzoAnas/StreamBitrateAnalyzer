@@ -167,4 +167,5 @@ cython_debug/
 /logs/
 config.json
 stream_urls.csv
+stream_urls copy.csv
 *.log
